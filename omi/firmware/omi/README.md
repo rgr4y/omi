@@ -29,6 +29,7 @@ The button/haptic/LED behavior in this branch is customized for hardware 5.0 / f
   - Distinct rhythm haptics for paused vs resumed states
 - **Power off** is now **hold 5 seconds**, with heartbeat haptic buildup from ~2.5s and a final ~700 ms buzz at commit.
 - Connected-state LED is now a **faint slow blue breathe** (5 second cycle, 1.8s up / 1.8s down / 1.4s off), driven by a dedicated 50 Hz timer with nanosecond PWM pulse updates for smoother dim output.
+- This branch identifies itself as `CONFIG_BT_DIS_FW_REV_STR="3.0.21-rob1"` in `omi.conf`.
 
 Tunable constants are intentionally grouped near the top of:
 
