@@ -16,6 +16,25 @@ Note: Open "firmware" folder in your code editor. Don't open the root omi folder
 
  <img width="986" alt="Screenshot 2025-04-20 at 12 48 49" src="https://github.com/user-attachments/assets/ccce238d-fa4b-4cbc-af7c-fc7688569b95" />
 
+## Custom interaction profile (Rob, phase 2 firmware)
+
+The button/haptic/LED behavior in this branch is customized for hardware 5.0 / firmware baseline 3.0.21:
+
+- **Single tap** emits BLE button event code `6` (`BOOKMARK_TAP`), not `1`, and is rate-limited to one accepted bookmark every 30 seconds (`BOOKMARK_DEBOUNCE_WINDOW_MS` in `src/lib/core/button.c`).
+  - Accepted bookmark haptic: one crisp tick (100 ms)
+  - Ignored bookmark haptic: quick double tick (60 ms, 90 ms gap, 60 ms)
+- **Pause/resume** is **hold ~1s then release**:
+  - 50 ms "armed" tick at the 1 second threshold
+  - BLE button event code `7` (`PAUSE_TOGGLE`) on release in the 1.0-2.5 second window
+  - Distinct rhythm haptics for paused vs resumed states
+- **Power off** is now **hold 5 seconds**, with heartbeat haptic buildup from ~2.5s and a final ~700 ms buzz at commit.
+- Connected-state LED is now a **faint slow blue breathe** (5 second cycle, 1.8s up / 1.8s down / 1.4s off), driven by a dedicated 50 Hz timer with nanosecond PWM pulse updates for smoother dim output.
+
+Tunable constants are intentionally grouped near the top of:
+
+- `src/lib/core/button.c`
+- `src/main.c` (breathe timing/brightness)
+
 
 
 ## WIP
@@ -54,7 +73,7 @@ Note: Open "firmware" folder in your code editor. Don't open the root omi folder
     - [x] Fix the issue: The led during charging + device off ~ green only, does not provide correct feedback. charging still works.
   - [x] Buttons
     - [x] Turn the device on/off(entering the deepsleep mode)
-    - [x] Long press (3 s) to power off
+    - [x] Long press (5 s in the custom phase-2 profile) to power off
     - [x] Test the deepsleep mode's battery draining.
   - [x] SD NAND (2/3)
     - [x] Store audio in a raw-sector ring
@@ -62,7 +81,7 @@ Note: Open "firmware" folder in your code editor. Don't open the root omi folder
     - [ ] Transfer via Wi-Fi
   - [x] Haptic
     - [x] Haptic on turning on/off
-    - [x] Long press (3 s) to power off
+    - [x] Long press (5 s in the custom phase-2 profile) to power off
     - [x] Recheck the mass production version, since the current motor is not good https://github.com/BasedHardware/omi/pull/2281#issuecomment-2841105447
   - [x] Battery (1/2)
     - [x] Percentage feedbacks via BLE

@@ -38,6 +38,74 @@ bool is_charging = false;
 bool is_off = false;
 bool blink_toggle = false;
 
+// Blue breathe profile for connected/recording state.
+#define LED_BREATHE_UPDATE_MS 20U
+#define LED_BREATHE_RISE_MS 1800U
+#define LED_BREATHE_FALL_MS 1800U
+#define LED_BREATHE_OFF_MS 1400U
+#define LED_BREATHE_CYCLE_MS (LED_BREATHE_RISE_MS + LED_BREATHE_FALL_MS + LED_BREATHE_OFF_MS)
+#define LED_BREATHE_PEAK_PERCENT 8U
+
+static struct k_work_delayable led_breathe_work;
+static uint32_t led_breathe_elapsed_ms;
+static bool led_breathe_active;
+
+static bool led_breathe_should_run(void)
+{
+    if (is_off || is_charging || !is_connected || button_is_recording_paused()) {
+        return false;
+    }
+#ifdef CONFIG_OMI_ENABLE_OFFLINE_STORAGE
+    if (!rtc_is_valid()) {
+        return false;
+    }
+#endif
+    return true;
+}
+
+static uint32_t led_breathe_blue_pulse_ns(void)
+{
+    uint32_t period_ns = led_get_period_ns(LED_BLUE);
+    uint32_t dim_ratio = app_settings_get_dim_ratio();
+    if (dim_ratio > 100U) {
+        dim_ratio = 100U;
+    }
+
+    uint32_t peak_pulse_ns = (period_ns * LED_BREATHE_PEAK_PERCENT * dim_ratio) / 10000U;
+    uint32_t phase_ms = led_breathe_elapsed_ms % LED_BREATHE_CYCLE_MS;
+    uint32_t level_milli = 0;
+
+    if (phase_ms < LED_BREATHE_RISE_MS) {
+        uint32_t linear_milli = (phase_ms * 1000U) / LED_BREATHE_RISE_MS;
+        level_milli = (linear_milli * linear_milli) / 1000U;
+    } else if (phase_ms < (LED_BREATHE_RISE_MS + LED_BREATHE_FALL_MS)) {
+        uint32_t fall_ms = phase_ms - LED_BREATHE_RISE_MS;
+        uint32_t linear_milli = ((LED_BREATHE_FALL_MS - fall_ms) * 1000U) / LED_BREATHE_FALL_MS;
+        level_milli = (linear_milli * linear_milli) / 1000U;
+    }
+
+    return (peak_pulse_ns * level_milli) / 1000U;
+}
+
+static void led_breathe_work_handler(struct k_work *work_item)
+{
+    ARG_UNUSED(work_item);
+
+    if (!led_breathe_should_run()) {
+        led_breathe_elapsed_ms = 0;
+        if (led_breathe_active) {
+            set_led_pwm_ns(LED_BLUE, 0);
+        }
+        led_breathe_active = false;
+    } else {
+        set_led_pwm_ns(LED_BLUE, led_breathe_blue_pulse_ns());
+        led_breathe_active = true;
+        led_breathe_elapsed_ms = (led_breathe_elapsed_ms + LED_BREATHE_UPDATE_MS) % LED_BREATHE_CYCLE_MS;
+    }
+
+    k_work_reschedule(&led_breathe_work, K_MSEC(LED_BREATHE_UPDATE_MS));
+}
+
 static void print_reset_reason(void)
 {
     uint32_t reas;
@@ -131,6 +199,8 @@ static void boot_ready_sequence(void)
 
 void set_led_state()
 {
+    bool update_blue_channel = true;
+
     // If device is off, turn off all LEDs immediately
     if (is_off) {
         led_off();
@@ -166,12 +236,25 @@ void set_led_state()
             blink_toggle = !blink_toggle;
         }
     } else {
-        blue = is_connected;
-        red = !is_connected;
+        if (!is_connected) {
+            red = true;
+        } else if (button_is_recording_paused()) {
+            // Pause state is intentionally dark in the custom model.
+            blue = false;
+            red = false;
+        } else if (led_breathe_should_run()) {
+            // Blue PWM is driven by the fast breathe timer.
+            update_blue_channel = false;
+            red = false;
+        } else {
+            blue = true;
+        }
     }
 
     set_led_green(green);
-    set_led_blue(blue);
+    if (update_blue_channel) {
+        set_led_blue(blue);
+    }
     set_led_red(red);
 }
 
@@ -222,6 +305,8 @@ int main(void)
         error_led_driver();
         return ret;
     }
+    k_work_init_delayable(&led_breathe_work, led_breathe_work_handler);
+    k_work_schedule(&led_breathe_work, K_NO_WAIT);
 
     // Suspend unused modules
     LOG_PRINTK("\n");

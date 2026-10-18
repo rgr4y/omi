@@ -11,6 +11,8 @@
 #include <zephyr/logging/log.h>
 #include <zephyr/pm/device_runtime.h>
 #include <zephyr/sys/poweroff.h>
+#include <zephyr/sys/util.h>
+#include <string.h>
 
 #include "haptic.h"
 #include "imu.h"
@@ -69,191 +71,285 @@ static bool was_pressed = false;
 
 // Using GPIO callback due to the lower priority of the input subsystem vs. storage.c's thread that prevents the
 // callback from working properly.
-#define BUTTON_CHECK_INTERVAL 40 // 0.04 seconds, 25 Hz
+#define BUTTON_CHECK_INTERVAL_MS 40U
 
-void check_button_level(struct k_work *work_item);
-
-K_WORK_DELAYABLE_DEFINE(button_work, check_button_level);
-
-#define DEFAULT_STATE 0
-#define SINGLE_TAP 1
 #define DOUBLE_TAP 2
-#define LONG_TAP 3
-#define BUTTON_PRESS 4
 #define BUTTON_RELEASE 5
+#define BOOKMARK_TAP 6
+#define PAUSE_TOGGLE 7
 
-// 4 is button down, 5 is button up
-static FSM_STATE_T current_button_state = IDLE;
-static uint32_t inc_count_1 = 0;
-static uint32_t inc_count_0 = 0;
+// Tweakables for the custom interaction model.
+#define TAP_THRESHOLD_MS 300U
+#define DOUBLE_TAP_WINDOW_MS 600U
+#define BOOKMARK_DEBOUNCE_WINDOW_MS (30U * 1000U)
+#define PAUSE_HOLD_THRESHOLD_MS 1000U
+#define POWEROFF_HEARTBEAT_START_MS 2500U
+#define POWEROFF_HOLD_MS 5000U
 
-static int final_button_state[2] = {0, 0};
-const static int threshold = 10;
-
-static void reset_count()
-{
-    inc_count_0 = 0;
-    inc_count_1 = 0;
-}
-static inline void notify_press()
-{
-    final_button_state[0] = BUTTON_PRESS;
-    LOG_INF("Button pressed");
-    struct bt_conn *conn = get_current_connection();
-    if (conn != NULL) {
-        bt_gatt_notify(conn, &button_service.attrs[1], &final_button_state, sizeof(final_button_state));
-    }
-}
-
-static inline void notify_unpress()
-{
-    final_button_state[0] = BUTTON_RELEASE;
-    LOG_INF("Button released");
-    struct bt_conn *conn = get_current_connection();
-    if (conn != NULL) {
-        bt_gatt_notify(conn, &button_service.attrs[1], &final_button_state, sizeof(final_button_state));
-    }
-}
-
-static inline void notify_tap()
-{
-    final_button_state[0] = SINGLE_TAP;
-    LOG_INF("Button single tap");
-    struct bt_conn *conn = get_current_connection();
-    if (conn != NULL) {
-        bt_gatt_notify(conn, &button_service.attrs[1], &final_button_state, sizeof(final_button_state));
-    }
-}
-
-static inline void notify_double_tap()
-{
-    final_button_state[0] = DOUBLE_TAP; // button press
-    LOG_INF("Button double tap");
-    struct bt_conn *conn = get_current_connection();
-    if (conn != NULL) {
-        bt_gatt_notify(conn, &button_service.attrs[1], &final_button_state, sizeof(final_button_state));
-    }
-}
-
-static inline void notify_long_tap()
-{
-    final_button_state[0] = LONG_TAP; // button press
-    LOG_INF("Button long tap");
-    struct bt_conn *conn = get_current_connection();
-    if (conn != NULL) {
-        bt_gatt_notify(conn, &button_service.attrs[1], &final_button_state, sizeof(final_button_state));
-    }
-}
+#define HAPTIC_MARK_MS 100U
+#define HAPTIC_NOPE_PULSE_MS 60U
+#define HAPTIC_NOPE_GAP_MS 90U
+#define HAPTIC_ARMED_MS 50U
+#define HAPTIC_RESUMED_PULSE_MS 70U
+#define HAPTIC_RESUMED_GAP_MS 60U
+#define HAPTIC_PAUSED_LONG_MS 400U
+#define HAPTIC_PAUSED_GAP_MS 300U
+#define HAPTIC_PAUSED_SHORT_MS 150U
+#define HAPTIC_HEARTBEAT_FINAL_MS 700U
+#define HAPTIC_SHUTDOWN_DEFAULT_MS 100U
+#define HAPTIC_SHUTDOWN_SETTLE_MS 200U
 
 #define BUTTON_PRESSED 1
 #define BUTTON_RELEASED 0
 
-#define TAP_THRESHOLD 300     // 300 ms for single tap
-#define DOUBLE_TAP_WINDOW 600 // 600 ms maximum for double-tap
-#define LONG_PRESS_TIME 3000  // 3000 ms for long press (power off)
+static const uint16_t heartbeat_start_ms[] = {2500U, 3300U, 3950U, 4500U};
+static const uint16_t heartbeat_pulse_ms[] = {80U, 120U, 170U, 230U};
 
-typedef enum {
-    BUTTON_EVENT_NONE,
-    BUTTON_EVENT_SINGLE_TAP,
-    BUTTON_EVENT_DOUBLE_TAP,
-    BUTTON_EVENT_LONG_PRESS,
-    BUTTON_EVENT_RELEASE
-} ButtonEvent;
+struct haptic_pattern {
+    const uint16_t *pulse_ms;
+    const uint16_t *gap_ms;
+    uint8_t pulse_count;
+};
 
-static uint32_t current_time = 0;
-static uint32_t btn_press_start_time;
-static uint32_t btn_release_time;
-static uint32_t btn_last_tap_time;
+static const uint16_t haptic_nope_pulses[] = {HAPTIC_NOPE_PULSE_MS, HAPTIC_NOPE_PULSE_MS};
+static const uint16_t haptic_nope_gaps[] = {HAPTIC_NOPE_GAP_MS};
+static const struct haptic_pattern haptic_pattern_nope = {
+    .pulse_ms = haptic_nope_pulses,
+    .gap_ms = haptic_nope_gaps,
+    .pulse_count = ARRAY_SIZE(haptic_nope_pulses),
+};
+
+static const uint16_t haptic_resumed_pulses[] =
+    {HAPTIC_RESUMED_PULSE_MS, HAPTIC_RESUMED_PULSE_MS, HAPTIC_RESUMED_PULSE_MS};
+static const uint16_t haptic_resumed_gaps[] = {HAPTIC_RESUMED_GAP_MS, HAPTIC_RESUMED_GAP_MS};
+static const struct haptic_pattern haptic_pattern_resumed = {
+    .pulse_ms = haptic_resumed_pulses,
+    .gap_ms = haptic_resumed_gaps,
+    .pulse_count = ARRAY_SIZE(haptic_resumed_pulses),
+};
+
+static const uint16_t haptic_paused_pulses[] = {HAPTIC_PAUSED_LONG_MS, HAPTIC_PAUSED_SHORT_MS};
+static const uint16_t haptic_paused_gaps[] = {HAPTIC_PAUSED_GAP_MS};
+static const struct haptic_pattern haptic_pattern_paused = {
+    .pulse_ms = haptic_paused_pulses,
+    .gap_ms = haptic_paused_gaps,
+    .pulse_count = ARRAY_SIZE(haptic_paused_pulses),
+};
+
+static FSM_STATE_T current_button_state = IDLE;
+static int final_button_state[2] = {0, 0};
+
 static bool btn_is_pressed;
+static uint32_t btn_press_start_ms;
+static bool pending_short_tap;
+static uint32_t pending_short_tap_release_ms;
+static uint32_t last_bookmark_accepted_ms;
+static bool hold_armed_feedback_sent;
+static bool heartbeat_sent[ARRAY_SIZE(heartbeat_start_ms)];
+static bool poweroff_triggered;
+static bool recording_paused;
 
-static u_int8_t btn_last_event = BUTTON_EVENT_NONE;
+static const struct haptic_pattern *active_haptic_pattern;
+static uint8_t active_haptic_pattern_index;
 
-void check_button_level(struct k_work *work_item)
+static void check_button_level(struct k_work *work_item);
+static void button_haptic_pattern_work_handler(struct k_work *work_item);
+static void turnoff_all_with_haptic(uint32_t haptic_duration_ms);
+
+K_WORK_DELAYABLE_DEFINE(button_work, check_button_level);
+K_WORK_DELAYABLE_DEFINE(button_haptic_pattern_work, button_haptic_pattern_work_handler);
+
+static inline void notify_button_event(uint8_t code, uint8_t value, const char *event_name)
 {
-    current_time = current_time + 1;
+    final_button_state[0] = code;
+    final_button_state[1] = value;
+    LOG_INF("%s", event_name);
+    struct bt_conn *conn = get_current_connection();
+    if (conn != NULL) {
+        bt_gatt_notify(conn, &button_service.attrs[1], &final_button_state, sizeof(final_button_state));
+    }
+}
 
-    u_int8_t btn_state = was_pressed ? BUTTON_PRESSED : BUTTON_RELEASED;
+static inline void notify_release(void)
+{
+    notify_button_event(BUTTON_RELEASE, 0, "Button released");
+}
 
-    ButtonEvent event = BUTTON_EVENT_NONE;
+static inline void notify_double_tap(void)
+{
+    notify_button_event(DOUBLE_TAP, 0, "Button double tap");
+}
 
-    // Debouncing pressed state
-    if (btn_state == BUTTON_PRESSED && !btn_is_pressed) {
-        btn_is_pressed = true;
-        btn_press_start_time = current_time;
-    } else if (btn_state == BUTTON_RELEASED && btn_is_pressed) {
-        btn_is_pressed = false;
-        btn_release_time = current_time;
+static inline void notify_bookmark_tap(void)
+{
+    notify_button_event(BOOKMARK_TAP, 0, "Button bookmark tap");
+}
 
-        // Check for double tap
-        uint32_t press_duration = (btn_release_time - btn_press_start_time) * BUTTON_CHECK_INTERVAL;
-        if (press_duration < TAP_THRESHOLD) {
-            if (btn_last_tap_time > 0 &&
-                (current_time - btn_last_tap_time) * BUTTON_CHECK_INTERVAL < DOUBLE_TAP_WINDOW) {
-                event = BUTTON_EVENT_DOUBLE_TAP;
-                btn_last_tap_time = 0; // Reset double-tap / single-tap detection
-            } else {
-                btn_last_tap_time = current_time;
+static inline void notify_pause_toggle(void)
+{
+    notify_button_event(PAUSE_TOGGLE, recording_paused ? 1 : 0, "Button pause/resume toggle");
+}
+
+static void stop_haptic_pattern(bool stop_motor)
+{
+    active_haptic_pattern = NULL;
+    active_haptic_pattern_index = 0;
+    k_work_cancel_delayable(&button_haptic_pattern_work);
+    if (stop_motor) {
+        play_haptic_milli(0);
+    }
+}
+
+static void start_haptic_pattern(const struct haptic_pattern *pattern)
+{
+    if (pattern == NULL || pattern->pulse_count == 0 || pattern->pulse_ms == NULL) {
+        return;
+    }
+
+    stop_haptic_pattern(false);
+    active_haptic_pattern = pattern;
+    active_haptic_pattern_index = 0;
+    play_haptic_milli(pattern->pulse_ms[0]);
+
+    if (pattern->pulse_count > 1) {
+        uint32_t next_delay_ms = pattern->pulse_ms[0] + pattern->gap_ms[0];
+        k_work_reschedule(&button_haptic_pattern_work, K_MSEC(next_delay_ms));
+    } else {
+        active_haptic_pattern = NULL;
+    }
+}
+
+static void button_haptic_pattern_work_handler(struct k_work *work_item)
+{
+    ARG_UNUSED(work_item);
+    if (active_haptic_pattern == NULL) {
+        return;
+    }
+
+    active_haptic_pattern_index++;
+    if (active_haptic_pattern_index >= active_haptic_pattern->pulse_count) {
+        active_haptic_pattern = NULL;
+        return;
+    }
+
+    play_haptic_milli(active_haptic_pattern->pulse_ms[active_haptic_pattern_index]);
+
+    if ((active_haptic_pattern_index + 1U) < active_haptic_pattern->pulse_count) {
+        uint32_t next_delay_ms = active_haptic_pattern->pulse_ms[active_haptic_pattern_index] +
+                                 active_haptic_pattern->gap_ms[active_haptic_pattern_index];
+        k_work_reschedule(&button_haptic_pattern_work, K_MSEC(next_delay_ms));
+    } else {
+        active_haptic_pattern = NULL;
+    }
+}
+
+static void reset_press_state(void)
+{
+    btn_press_start_ms = 0;
+    hold_armed_feedback_sent = false;
+    poweroff_triggered = false;
+    memset(heartbeat_sent, 0, sizeof(heartbeat_sent));
+}
+
+static void handle_bookmark_tap(uint32_t now_ms)
+{
+    struct bt_conn *conn = get_current_connection();
+    if (conn == NULL) {
+        LOG_INF("Bookmark ignored (not connected)");
+        start_haptic_pattern(&haptic_pattern_nope);
+        return;
+    }
+
+    bool accepted =
+        (last_bookmark_accepted_ms == 0U) || ((now_ms - last_bookmark_accepted_ms) >= BOOKMARK_DEBOUNCE_WINDOW_MS);
+
+    if (accepted) {
+        last_bookmark_accepted_ms = now_ms;
+        notify_bookmark_tap();
+        stop_haptic_pattern(false);
+        play_haptic_milli(HAPTIC_MARK_MS);
+        return;
+    }
+
+    uint32_t cooldown_ms = BOOKMARK_DEBOUNCE_WINDOW_MS - (now_ms - last_bookmark_accepted_ms);
+    LOG_INF("Bookmark ignored (cooldown active: %u ms left)", cooldown_ms);
+    start_haptic_pattern(&haptic_pattern_nope);
+}
+
+static void process_hold_feedback(uint32_t hold_ms)
+{
+    if (!hold_armed_feedback_sent && hold_ms >= PAUSE_HOLD_THRESHOLD_MS) {
+        hold_armed_feedback_sent = true;
+        stop_haptic_pattern(false);
+        play_haptic_milli(HAPTIC_ARMED_MS);
+    }
+
+    if (hold_ms >= POWEROFF_HEARTBEAT_START_MS && hold_ms < POWEROFF_HOLD_MS) {
+        for (size_t i = 0; i < ARRAY_SIZE(heartbeat_start_ms); i++) {
+            if (!heartbeat_sent[i] && hold_ms >= heartbeat_start_ms[i]) {
+                heartbeat_sent[i] = true;
+                stop_haptic_pattern(false);
+                play_haptic_milli(heartbeat_pulse_ms[i]);
             }
         }
     }
 
-    // Check for single tap
-    if (btn_state == BUTTON_RELEASED && !btn_is_pressed) {
-        uint32_t press_duration = (btn_release_time - btn_press_start_time) * BUTTON_CHECK_INTERVAL;
-        if (press_duration < TAP_THRESHOLD && btn_last_tap_time > 0 &&
-            (current_time - btn_press_start_time) * BUTTON_CHECK_INTERVAL > TAP_THRESHOLD) {
-            event = BUTTON_EVENT_SINGLE_TAP;
-            btn_last_tap_time = 0;
-        } else if ((current_time - btn_press_start_time) * BUTTON_CHECK_INTERVAL > TAP_THRESHOLD) {
-            event = BUTTON_EVENT_RELEASE;
+    if (!poweroff_triggered && hold_ms >= POWEROFF_HOLD_MS) {
+        poweroff_triggered = true;
+        turnoff_all_with_haptic(HAPTIC_HEARTBEAT_FINAL_MS);
+    }
+}
+
+static void check_button_level(struct k_work *work_item)
+{
+    ARG_UNUSED(work_item);
+    uint32_t now_ms = k_uptime_get_32();
+    uint8_t btn_state = was_pressed ? BUTTON_PRESSED : BUTTON_RELEASED;
+
+    if (btn_state == BUTTON_PRESSED && !btn_is_pressed) {
+        btn_is_pressed = true;
+        btn_press_start_ms = now_ms;
+        hold_armed_feedback_sent = false;
+        poweroff_triggered = false;
+        memset(heartbeat_sent, 0, sizeof(heartbeat_sent));
+    } else if (btn_state == BUTTON_RELEASED && btn_is_pressed && !poweroff_triggered) {
+        btn_is_pressed = false;
+        uint32_t press_duration_ms = now_ms - btn_press_start_ms;
+
+        if (press_duration_ms < TAP_THRESHOLD_MS) {
+            if (pending_short_tap && (now_ms - pending_short_tap_release_ms) <= DOUBLE_TAP_WINDOW_MS) {
+                pending_short_tap = false;
+                notify_double_tap();
+            } else {
+                pending_short_tap = true;
+                pending_short_tap_release_ms = now_ms;
+            }
+        } else if (press_duration_ms >= PAUSE_HOLD_THRESHOLD_MS && press_duration_ms < POWEROFF_HEARTBEAT_START_MS) {
+            pending_short_tap = false;
+            recording_paused = !recording_paused;
+            notify_pause_toggle();
+            start_haptic_pattern(recording_paused ? &haptic_pattern_paused : &haptic_pattern_resumed);
+        } else if (press_duration_ms >= POWEROFF_HEARTBEAT_START_MS && press_duration_ms < POWEROFF_HOLD_MS) {
+            pending_short_tap = false;
+            stop_haptic_pattern(true);
         }
-    }
 
-    // Check for long press
-    if (btn_is_pressed && (current_time - btn_press_start_time) * BUTTON_CHECK_INTERVAL >= LONG_PRESS_TIME) {
-        event = BUTTON_EVENT_LONG_PRESS;
-    }
-
-    // Single tap
-    if (event == BUTTON_EVENT_SINGLE_TAP) {
-        LOG_INF("single tap detected\n");
-        btn_last_event = event;
-
-        notify_tap();
-    }
-
-    // Double tap
-    if (event == BUTTON_EVENT_DOUBLE_TAP) {
-        LOG_INF("double tap detected\n");
-        btn_last_event = event;
-        notify_double_tap();
-    }
-
-    // Long press, one time event
-    if (event == BUTTON_EVENT_LONG_PRESS && btn_last_event != BUTTON_EVENT_LONG_PRESS) {
-        LOG_INF("long press detected\n");
-        btn_last_event = event;
-        turnoff_all();
-    }
-
-    // Releases, one time event
-    if (event == BUTTON_EVENT_RELEASE && btn_last_event != BUTTON_EVENT_RELEASE) {
-        LOG_PRINTK("release detected\n");
-        btn_last_event = event;
-        notify_unpress();
-
-        // Reset
-        current_time = 0;
-        btn_press_start_time = 0;
-        btn_release_time = 0;
-        btn_last_tap_time = 0;
-    }
-    if (event == BUTTON_EVENT_RELEASE) {
         current_button_state = GRACE;
+        notify_release();
+        reset_press_state();
+    } else if (btn_state == BUTTON_RELEASED && !btn_is_pressed && pending_short_tap &&
+               (now_ms - pending_short_tap_release_ms) > DOUBLE_TAP_WINDOW_MS) {
+        pending_short_tap = false;
+        handle_bookmark_tap(now_ms);
+    } else if (btn_state == BUTTON_PRESSED && btn_is_pressed && !poweroff_triggered) {
+        uint32_t hold_ms = now_ms - btn_press_start_ms;
+        if (pending_short_tap && hold_ms >= TAP_THRESHOLD_MS) {
+            pending_short_tap = false;
+        }
+        process_hold_feedback(hold_ms);
     }
 
-    k_work_reschedule(&button_work, K_MSEC(BUTTON_CHECK_INTERVAL));
-    return 0;
+    k_work_reschedule(&button_work, K_MSEC(BUTTON_CHECK_INTERVAL_MS));
 }
 
 static ssize_t button_data_read_characteristic(struct bt_conn *conn,
@@ -331,7 +427,7 @@ int button_init()
 
 void activate_button_work()
 {
-    k_work_schedule(&button_work, K_MSEC(BUTTON_CHECK_INTERVAL));
+    k_work_schedule(&button_work, K_MSEC(BUTTON_CHECK_INTERVAL_MS));
 }
 
 void register_button_service()
@@ -346,6 +442,11 @@ FSM_STATE_T get_current_button_state()
 
 void turnoff_all()
 {
+    turnoff_all_with_haptic(HAPTIC_SHUTDOWN_DEFAULT_MS);
+}
+
+static void turnoff_all_with_haptic(uint32_t haptic_duration_ms)
+{
     int rc;
 
     // Immediate feedback: LED off and haptic
@@ -354,9 +455,11 @@ void turnoff_all()
     is_off = true;
 
 #ifdef CONFIG_OMI_ENABLE_HAPTIC
-    play_haptic_milli(100);
-    k_msleep(300);
-    haptic_off();
+    if (haptic_duration_ms > 0U) {
+        play_haptic_milli(haptic_duration_ms);
+        k_msleep(haptic_duration_ms + HAPTIC_SHUTDOWN_SETTLE_MS);
+        haptic_off();
+    }
 #endif
 
     // Delays for stability
@@ -431,4 +534,9 @@ void turnoff_all()
 void force_button_state(FSM_STATE_T state)
 {
     current_button_state = state;
+}
+
+bool button_is_recording_paused(void)
+{
+    return recording_paused;
 }

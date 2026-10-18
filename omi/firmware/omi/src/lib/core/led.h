@@ -23,6 +23,8 @@ void set_led_red(bool on);
 void set_led_green(bool on);
 void set_led_blue(bool on);
 void set_led_pwm(led_color_t color, uint8_t level);
+void set_led_pwm_ns(led_color_t color, uint32_t pulse_width_ns);
+uint32_t led_get_period_ns(led_color_t color);
 void led_off(void);
 
 #endif

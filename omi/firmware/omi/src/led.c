@@ -13,6 +13,21 @@ static const struct pwm_dt_spec led_red = PWM_DT_SPEC_GET(DT_NODELABEL(led_red))
 static const struct pwm_dt_spec led_green = PWM_DT_SPEC_GET(DT_NODELABEL(led_green));
 static const struct pwm_dt_spec led_blue = PWM_DT_SPEC_GET(DT_NODELABEL(led_blue));
 
+static const struct pwm_dt_spec *get_led_spec(led_color_t color)
+{
+    switch (color) {
+    case LED_RED:
+        return &led_red;
+    case LED_GREEN:
+        return &led_green;
+    case LED_BLUE:
+        return &led_blue;
+    default:
+        LOG_ERR("Invalid LED color");
+        return NULL;
+    }
+}
+
 int led_start()
 {
     ASSERT_TRUE(pwm_is_ready_dt(&led_red));
@@ -58,20 +73,8 @@ void set_led_blue(bool on)
 
 void set_led_pwm(led_color_t color, uint8_t level)
 {
-    const struct pwm_dt_spec *led;
-
-    switch (color) {
-    case LED_RED:
-        led = &led_red;
-        break;
-    case LED_GREEN:
-        led = &led_green;
-        break;
-    case LED_BLUE:
-        led = &led_blue;
-        break;
-    default:
-        LOG_ERR("Invalid LED color");
+    const struct pwm_dt_spec *led = get_led_spec(color);
+    if (led == NULL) {
         return;
     }
 
@@ -86,6 +89,35 @@ void set_led_pwm(led_color_t color, uint8_t level)
 
     uint32_t pulse_width_ns = (led->period * level) / 100;
     pwm_set_pulse_dt(led, pulse_width_ns);
+}
+
+void set_led_pwm_ns(led_color_t color, uint32_t pulse_width_ns)
+{
+    const struct pwm_dt_spec *led = get_led_spec(color);
+    if (led == NULL) {
+        return;
+    }
+
+    if (!pwm_is_ready_dt(led)) {
+        LOG_ERR("LED PWM device not ready");
+        return;
+    }
+
+    if (pulse_width_ns > led->period) {
+        pulse_width_ns = led->period;
+    }
+
+    pwm_set_pulse_dt(led, pulse_width_ns);
+}
+
+uint32_t led_get_period_ns(led_color_t color)
+{
+    const struct pwm_dt_spec *led = get_led_spec(color);
+    if (led == NULL) {
+        return 0;
+    }
+
+    return led->period;
 }
 
 void led_off(void)
